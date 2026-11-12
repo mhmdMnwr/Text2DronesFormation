@@ -19,6 +19,26 @@ pip install sentence-transformers torch pyflyt numpy scipy matplotlib plotly
 
 ---
 
+## 🎮 Interactive Prompt-to-Flight CLI (`fly.py`)
+
+Choose any word or phrase, and Text2Swarm will dynamically retrieve the 3D model, subdivide the wireframe into drones, solve Hungarian collision-free trajectories, and immediately launch the live 3D PyBullet simulation on your screen:
+
+```bash
+# 1. Interactive prompt input (asks for a word):
+python fly.py
+
+# 2. Direct command with any word or phrase:
+python fly.py "fighter jet"
+python fly.py "guitar"
+python fly.py "sports car"
+python fly.py "luxury yacht" --drones 50
+
+# 3. Headless fast physics mode (no GUI):
+python fly.py "chair" --headless
+```
+
+---
+
 ## 🔍 Semantic RAG Swarm Generator (CLI)
 
 Test the RAG swarm generator directly from your terminal using `test_rag.py`:
@@ -72,6 +92,7 @@ python simulate_swarm_pyflyt.py
 
 ```text
 Text2Swarm/
+├── fly.py                            # Interactive CLI: Enter word -> launches PyFlyt 3D simulation
 ├── test_rag.py                       # CLI test tool (query -> RAG -> subdivision -> 3D render)
 ├── simulate_swarm_pyflyt.py          # 50-drone multi-UAV physics, Hungarian assignment & PyFlyt GUI
 ├── 01_dataset_generation.ipynb       # KeypointNet extraction & 3D wireframe topology synthesis
