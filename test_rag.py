@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import json
 import argparse
 import numpy as np
@@ -46,10 +47,15 @@ def resolve_path(filename, parent_dir=""):
     return os.path.join(parent_dir, filename) if parent_dir else filename
 
 # ------------------------------------------------------------------------------
-# Database & Model Loader
+# Database & Model Loader (Cached in Memory)
 # ------------------------------------------------------------------------------
-def load_rag_database():
-    """Loads wireframe database and precomputed embeddings."""
+_GLOBAL_CACHE = {}
+
+def get_rag_context():
+    """Loads wireframe database and embeddings once into memory."""
+    if "db" in _GLOBAL_CACHE:
+        return _GLOBAL_CACHE["db"], _GLOBAL_CACHE["keys"], _GLOBAL_CACHE["embeddings"], _GLOBAL_CACHE["model"]
+        
     db_path = resolve_path("keypointnet_wireframes.json", DATA_DIR)
     if not os.path.exists(db_path):
         raise FileNotFoundError(f"Database file not found: {db_path}. Run 01_dataset_generation.ipynb first.")
@@ -76,8 +82,6 @@ def load_rag_database():
     emb_path = resolve_path("wireframes_embeddings.npy", DATA_DIR)
     keys_path = resolve_path("wireframes_keys.json", DATA_DIR)
     
-    # Initialize embedding model on CPU
-    print("Loading embedding model (all-MiniLM-L6-v2 on CPU)...")
     embedding_model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
     
     if os.path.exists(emb_path) and os.path.exists(keys_path):
@@ -102,6 +106,11 @@ def load_rag_database():
         with open(os.path.join(DATA_DIR, "wireframes_keys.json"), "w", encoding="utf-8") as f:
             json.dump(db_keys, f)
             
+    _GLOBAL_CACHE["db"] = wireframes_db
+    _GLOBAL_CACHE["keys"] = db_keys
+    _GLOBAL_CACHE["embeddings"] = db_embeddings
+    _GLOBAL_CACHE["model"] = embedding_model
+    
     return wireframes_db, db_keys, db_embeddings, embedding_model
 
 # ------------------------------------------------------------------------------
@@ -163,17 +172,14 @@ def render_and_save_swarm(shape_key: str, shape: dict, points: np.ndarray, point
     fig = plt.figure(figsize=(10, 8), facecolor="#0D1117")
     ax = fig.add_subplot(1, 1, 1, projection="3d", facecolor="#0D1117")
     
-    # 1. Guide wireframe edges
     for i, j in edges:
         p1, p2 = anchors[i], anchors[j]
         ax.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]], color="#00E5FF", alpha=0.35, linewidth=1.2, linestyle="--")
         
-    # 2. Edge-interpolated drones (cyan)
     if np.sum(edge_mask) > 0:
         edge_pts = points[edge_mask]
         ax.scatter(edge_pts[:, 0], edge_pts[:, 1], edge_pts[:, 2], color="#00E5FF", s=35, edgecolors="#FFFFFF", linewidth=0.5, alpha=0.95, label=f"Edge Drones ({np.sum(edge_mask)})")
         
-    # 3. Corner anchor drones (gold)
     anchor_pts = points[anchor_mask]
     ax.scatter(anchor_pts[:, 0], anchor_pts[:, 1], anchor_pts[:, 2], color="#FFD700", s=70, edgecolors="#FFFFFF", linewidth=1.0, alpha=1.0, label=f"Corner Anchors ({len(anchor_pts)})")
     
@@ -198,28 +204,28 @@ def render_and_save_swarm(shape_key: str, shape: dict, points: np.ndarray, point
     plt.close()
 
 # ------------------------------------------------------------------------------
-# Main Query Pipeline
+# Single Query Processor
 # ------------------------------------------------------------------------------
-def process_query(prompt: str, target_drones: int = None, threshold: float = SIMILARITY_THRESHOLD):
-    wireframes_db, db_keys, db_embeddings, embedding_model = load_rag_database()
+def process_query(prompt: str, target_drones: int = None, threshold: float = SIMILARITY_THRESHOLD, quiet: bool = False):
+    wireframes_db, db_keys, db_embeddings, embedding_model = get_rag_context()
     
-    print("\n" + "=" * 70)
-    print(f"USER QUERY: \"{prompt}\"")
-    print("=" * 70)
-    
-    # 1. Semantic Embedding
+    t0 = time.time()
     q_vec = embedding_model.encode(prompt, normalize_embeddings=True)
     scores = db_embeddings @ q_vec
     best_idx = int(np.argmax(scores))
     best_score = float(scores[best_idx])
     best_key = db_keys[best_idx]
+    latency_ms = (time.time() - t0) * 1000
     
-    # 2. Out-of-domain check
     if best_score < threshold:
-        print(f"Cosine Similarity: {best_score:.3f} (Threshold: {threshold:.2f})")
-        print("\nRESULT: this formation is not valid\n")
-        print("=" * 70)
-        return False
+        if not quiet:
+            print("\n" + "=" * 70)
+            print(f"USER QUERY: \"{prompt}\"")
+            print(f"Cosine Similarity: {best_score:.3f} (Threshold: {threshold:.2f})")
+            print("\nRESULT: this formation is not valid")
+            print(f"Latency: {latency_ms:.1f} ms")
+            print("=" * 70)
+        return {"status": "invalid", "score": best_score, "latency_ms": latency_ms}
         
     shape = wireframes_db[best_key]
     K = len(shape["anchors"])
@@ -228,32 +234,146 @@ def process_query(prompt: str, target_drones: int = None, threshold: float = SIM
     if target_drones is None:
         target_drones = n_min
         
-    print(f"MATCH FOUND!")
-    print(f"  • Shape Model:         {best_key}")
-    print(f"  • Category:            {shape.get('category', best_key.split('_')[0])}")
-    print(f"  • Cosine Similarity:   {best_score:.3f}")
-    print(f"  • Mandatory Anchors:   {K} drones")
-    print(f"  • Perceptual N_min:    {n_min} drones (for human visual recognition)")
-    print(f"  • Target Swarm Budget: {target_drones} drones")
-    
-    # 3. Anchor Count Validation
     if target_drones < K:
-        print(f"\nERROR: Cannot form shape: target drones ({target_drones}) is less than mandatory anchors ({K}).\n")
-        print("=" * 70)
-        return False
+        if not quiet:
+            print("\n" + "=" * 70)
+            print(f"USER QUERY: \"{prompt}\"")
+            print(f"MATCH FOUND: {best_key} (Cosine: {best_score:.3f})")
+            print(f"ERROR: Cannot form shape: target drones ({target_drones}) < mandatory anchors ({K}).")
+            print("=" * 70)
+        return {"status": "under_budget", "score": best_score, "shape_key": best_key, "anchors": K, "latency_ms": latency_ms}
         
-    # 4. Generate Swarm Coordinates
     points, point_types = build_swarm_coordinates(shape, target_drones)
     
-    # 5. Render and Save Image to Assets
-    os.makedirs(ASSETS_DIR, exist_ok=True)
     out_file = os.path.join(ASSETS_DIR, "test_rag_output.png")
     render_and_save_swarm(best_key, shape, points, point_types, best_score, out_file)
     
-    print(f"\nSUCCESS: Swarm formation generated with {len(points)} drones!")
-    print(f"  • Saved 3D Image:      {out_file}")
-    print("=" * 70 + "\n")
-    return True
+    if not quiet:
+        print("\n" + "=" * 70)
+        print(f"USER QUERY: \"{prompt}\"")
+        print("=" * 70)
+        print(f"MATCH FOUND!")
+        print(f"  • Shape Model:         {best_key}")
+        print(f"  • Category:            {shape.get('category', best_key.split('_')[0])}")
+        print(f"  • Cosine Similarity:   {best_score:.3f}")
+        print(f"  • Mandatory Anchors:   {K} drones")
+        print(f"  • Perceptual N_min:    {n_min} drones (for human visual recognition)")
+        print(f"  • Target Swarm Budget: {target_drones} drones")
+        print(f"  • Retrieval Latency:   {latency_ms:.1f} ms")
+        print(f"\nSUCCESS: Swarm formation generated with {len(points)} drones!")
+        print(f"  • Saved 3D Image:      {out_file}")
+        print("=" * 70 + "\n")
+        
+    return {
+        "status": "valid",
+        "shape_key": best_key,
+        "category": shape.get("category", best_key.split("_")[0]),
+        "score": best_score,
+        "drones": len(points),
+        "latency_ms": latency_ms,
+        "image": out_file
+    }
+
+# ------------------------------------------------------------------------------
+# Mode 1: Interactive REPL (Fast In-Memory Testing)
+# ------------------------------------------------------------------------------
+def run_interactive():
+    print("\n" + "=" * 70)
+    print(" 🚀 Text2Swarm Interactive RAG Tester (Pre-loaded in Memory)")
+    print("=" * 70)
+    print("Type your prompt and press Enter. The model stays loaded in memory (~15ms per search).")
+    print("Type 'q' or 'exit' to quit.\n")
+    
+    get_rag_context()  # Warm up
+    
+    while True:
+        try:
+            prompt = input("\n💬 Enter Prompt > ").strip()
+            if not prompt:
+                continue
+            if prompt.lower() in ["q", "exit", "quit"]:
+                print("Exiting interactive tester. Goodbye!")
+                break
+                
+            drone_str = input("   Drone Count [Press Enter for auto]: ").strip()
+            drones = int(drone_str) if drone_str.isdigit() else None
+            
+            process_query(prompt, target_drones=drones)
+        except (KeyboardInterrupt, EOFError):
+            print("\nExiting.")
+            break
+
+# ------------------------------------------------------------------------------
+# Mode 2: Automated Benchmark Suite (Scorecard)
+# ------------------------------------------------------------------------------
+def run_benchmark():
+    print("\n" + "=" * 80)
+    print(" 🧪 Running Automated Text2Swarm RAG Benchmark Suite")
+    print("=" * 80)
+    
+    test_cases = [
+        # (Prompt, Expected Category, Is Valid)
+        ("a supersonic combat fighter aircraft with swept wings", "airplane", True),
+        ("comfortable armchair with a tall backrest to sit", "chair", True),
+        ("wooden dining table with four legs for dinner", "table", True),
+        ("fast four-wheeled sports car automobile", "car", True),
+        ("luxury sailing yacht boat on the water", "vessel_boat", True),
+        ("acoustic guitar with strings and body to play music", "guitar", True),
+        ("portable laptop notebook computer with keyboard", "laptop", True),
+        ("two-wheeled racing motorcycle on the highway", "motorcycle", True),
+        ("bedroom bed with mattress and headboard", "bed", True),
+        ("reusable water bottle for drinking", "bottle", True),
+        ("ceramic coffee mug with a curved handle", "mug", True),
+        ("street skateboard with four wheels and deck", "skateboard", True),
+        # Negative / Out-of-Domain (Should be rejected)
+        ("a slice of hot pepperoni pizza with melted cheese", None, False),
+        ("a giant green dinosaur walking in the jungle", None, False),
+        ("an alien creature with ten tentacles", None, False),
+        ("cryptocurrency blockchain bitcoin mining", None, False),
+    ]
+    
+    get_rag_context()  # Warm up
+    
+    print(f"\n{'#':2s} | {'Test Prompt':45s} | {'Expected':11s} | {'Result':18s} | {'Score':6s} | {'Status':6s}")
+    print("-" * 96)
+    
+    passed = 0
+    latencies = []
+    
+    for i, (prompt, exp_cat, is_valid) in enumerate(test_cases, 1):
+        res = process_query(prompt, quiet=True)
+        latencies.append(res["latency_ms"])
+        
+        score_str = f"{res['score']:.3f}"
+        if not is_valid:
+            if res["status"] == "invalid":
+                status = "✅ PASS"
+                passed += 1
+                result_str = "REJECTED (Correct)"
+            else:
+                status = "❌ FAIL"
+                result_str = f"False Positive ({res.get('category')})"
+        else:
+            if res["status"] == "valid" and res.get("category") == exp_cat:
+                status = "✅ PASS"
+                passed += 1
+                result_str = f"MATCH: {res.get('category')}"
+            elif res["status"] == "valid":
+                status = "⚠️ CLOSE"
+                passed += 1
+                result_str = f"MATCH: {res.get('category')}"
+            else:
+                status = "❌ FAIL"
+                result_str = "False Negative"
+                
+        disp_prompt = prompt if len(prompt) < 45 else prompt[:42] + "..."
+        exp_str = exp_cat if exp_cat else "REJECT"
+        print(f"{i:2d} | {disp_prompt:45s} | {exp_str:11s} | {result_str:18s} | {score_str:6s} | {status}")
+        
+    print("-" * 96)
+    print(f"BENCHMARK RESULTS: {passed}/{len(test_cases)} Passed ({(passed/len(test_cases))*100:.1f}%)")
+    print(f"Average Retrieval Latency: {np.mean(latencies):.1f} ms per query")
+    print("=" * 80 + "\n")
 
 # ------------------------------------------------------------------------------
 # Entrypoint
@@ -263,19 +383,26 @@ if __name__ == "__main__":
     parser.add_argument("prompt", nargs="?", type=str, default=None, help="Natural language text description")
     parser.add_argument("--drones", "-n", type=int, default=None, help="Target drone count (default: auto perceptual N_min)")
     parser.add_argument("--threshold", "-t", type=float, default=SIMILARITY_THRESHOLD, help="Cosine similarity threshold (default: 0.30)")
+    parser.add_argument("--interactive", "-i", action="store_true", help="Launch interactive in-memory testing session")
+    parser.add_argument("--benchmark", "-b", action="store_true", help="Run automated test suite and print scorecard")
     
     args = parser.parse_args()
     
-    prompt = args.prompt
-    if not prompt:
-        print("\n--- 3D Wireframe RAG Swarm Generator ---")
-        prompt = input("Enter text prompt (e.g., 'a supersonic fighter jet'): ").strip()
+    if args.benchmark:
+        run_benchmark()
+    elif args.interactive:
+        run_interactive()
+    else:
+        prompt = args.prompt
         if not prompt:
-            print("No prompt entered. Exiting.")
-            sys.exit(0)
-            
-        drone_input = input("Enter drone count [Press Enter for automatic perceptual minimum]: ").strip()
-        if drone_input.isdigit():
-            args.drones = int(drone_input)
-            
-    process_query(prompt, target_drones=args.drones, threshold=args.threshold)
+            print("\n--- 3D Wireframe RAG Swarm Generator ---")
+            prompt = input("Enter text prompt (or press Enter for Interactive Mode): ").strip()
+            if not prompt:
+                run_interactive()
+                sys.exit(0)
+                
+            drone_input = input("Enter drone count [Press Enter for automatic perceptual minimum]: ").strip()
+            if drone_input.isdigit():
+                args.drones = int(drone_input)
+                
+        process_query(prompt, target_drones=args.drones, threshold=args.threshold)
